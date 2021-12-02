@@ -1,0 +1,4 @@
+[build]
+# https://doc.rust-lang.org/nightly/rustc/platform-support.html
+# Bare RISC-V (riscv64gc = RV64IMAFDC ISA)
+target = "riscv64gc-unknown-linux-gnu"

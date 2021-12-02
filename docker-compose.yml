@@ -1,0 +1,7 @@
+version: '3'
+
+services:
+    cort:
+        build:
+            context: .
+            dockerfile: Dockerfile
