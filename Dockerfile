@@ -1,11 +1,8 @@
-FROM --platform=riscv64 riscv64/debian:experimental
+FROM --platform=riscv64 riscv64/ubuntu
 
-# RUN apk add --no-cache build-essential curl
+RUN apt-get update 
+RUN apt-get install -y --no-install-recommends apt-utils  build-essential git curl wget 
 
+COPY ./target/riscv64gc-unknown-linux-gnu/debug/cort ./cort
 
-# RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
-# RUN echo 'source $HOME/.cargo/env' >> $HOME/.bashrc
-
-# COPY . .
-
-# CMD ["cargo", "run"]
+CMD ["./cort"]

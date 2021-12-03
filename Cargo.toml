@@ -3,9 +3,12 @@ edition = "2021"
 name = "cort"
 version = "0.1.0"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["staticlib"]
 
 [dependencies]
 lazy_static = {version = "1.4", features = ["spin_no_std"]}
-tracing = "0.1"
-tracing-subscriber = "0.2"
+# riscv = "0.7"
+
+[build-dependencies]
+cbindgen = "0.20"
