@@ -1,72 +1,188 @@
-// #![no_std]
 #![feature(asm)]
-#![feature(llvm_asm)]
+#![feature(naked_functions)]
+#![feature(map_first_last)]
+#![feature(negative_impls)]
+#![feature(global_asm)]
 
-const SSIZE: isize = 48;
+global_asm!(include_str!("uthread_switch.s"));
 
-#[derive(Debug, Default)]
+mod utils;
+
+use lazy_static::lazy_static;
+use std::cell::RefCell;
+use std::mem::{self, align_of, size_of};
+use std::sync::{Mutex, Once};
+
+use crate::utils::align_down;
+
+const DEFAULT_STACK_SIZE: usize = 4 * utils::KILOBYTE;
+
+#[derive(Debug, Default, PartialEq, Eq)]
 #[repr(C)]
-struct ThreadContext {
-    rsp: u64,
+pub struct CalleeSaved {
+    rsp: usize,
+    r15: usize,
+    r14: usize,
+    r13: usize,
+    r12: usize,
+    rbx: usize,
+    rbp: usize,
 }
 
-fn hello() -> ! {
-    println!("Hello, world!");
-    loop {}
+extern "C" {
+    fn uthread_switch(prev: *const CalleeSaved, next: *const CalleeSaved);
 }
 
-// unsafe fn switch(new: *const ThreadContext) {
-//     // asm!(
-//     //     "
-//     //     mov rsp, $0
-//     //     ret"
-//     // );
-//     llvm_asm!("
-//         mv     0x0($0), pc
-//         ret
-//        "
-//     :
-//     : "r"(new)
-//     :
-//     : "alignstack" // it will work without this now, will need it later
-//     );
-// }
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum State {
+    Available,
+    Running,
+    Ready,
+}
 
-// fn main() {
-//     let mut ctx = ThreadContext::default();
-//     let mut stack = vec![0_u8; SSIZE as usize];
+#[derive(Debug)]
+struct Thread {
+    id: usize,
+    state: State,
+    stack: Vec<u8>,
+    ctx: CalleeSaved,
+}
 
-//     unsafe {
-//         let stack_bottom = stack.as_mut_ptr().offset(SSIZE);
-//         let sb_aligned = (stack_bottom as usize & !15) as *mut u8;
-//         std::ptr::write(sb_aligned.offset(-16) as *mut u64, hello as u64);
+impl Thread {
+    pub fn new(id: usize) -> Self {
+        Thread {
+            id: id,
+            stack: vec![0; DEFAULT_STACK_SIZE],
+            ctx: CalleeSaved::default(),
+            state: State::Available,
+        }
+    }
+}
 
-//         ctx.rsp = sb_aligned.offset(-16) as u64;
-//         switch(&mut ctx);
-//     }
-// }
+#[derive(Debug)]
+pub struct Runtime {
+    workers: Vec<Thread>,
+    current: usize,
+}
+impl !Sync for Runtime {}
+impl !Send for Runtime {}
+
+impl Runtime {
+    pub fn new() -> Self {
+        Runtime {
+            workers: vec![Thread {
+                id: 0,
+                stack: vec![0; 0],
+                ctx: CalleeSaved::default(),
+                state: State::Running,
+            }],
+            current: 0,
+        }
+    }
+
+    fn schedule(&mut self) {
+        let prev = self.current;
+        let next = self
+            .workers
+            .iter()
+            .position(|thread| thread.state == State::Ready);
+
+        println!("self.workers = {:?} next: {:?}", self.workers.len(), next);
+        if let Some(next) = next {
+            println!("switching from {} to {}", prev, next);
+            self.current = next;
+            self.workers[next].state = State::Running;
+
+            let prev_ctx = &self.workers[prev].ctx;
+            let next_ctx = &self.workers[next].ctx;
+            unsafe {
+                println!("switching from {:?} to {:?}", prev_ctx, next_ctx);
+                uthread_switch(prev_ctx, next_ctx);
+                println!("switched from {} to {}", prev, next);
+                println!("switched from {:?} to {:?}", prev_ctx, next_ctx);
+            }
+        } else {
+            self.current = 0;
+        }
+    }
+
+    pub extern "C" fn t_return(&mut self) {
+        assert!(self.current != 0);
+
+        let current = self.current;
+        self.workers[current].state = State::Available;
+        self.schedule();
+    }
+
+    pub extern "C" fn yield_now(&mut self) {
+        let current = self.current;
+        self.workers[current].state = State::Ready;
+        println!("yield {}", current);
+        self.schedule();
+    }
+
+    pub extern "C" fn spawn(&mut self, f: extern "C" fn()) {
+        match self
+            .workers
+            .iter_mut()
+            .find(|thread| thread.state == State::Available)
+        {
+            None => {
+                let available_thread = Thread::new(self.workers.len());
+                println!("allocated thread {}", available_thread.id);
+                self.workers.insert(available_thread.id, available_thread);
+                return self.spawn(f);
+            }
+            Some(available_thread) => {
+                unsafe {
+                    available_thread.ctx.rsp = align_down(
+                        available_thread.stack.as_ptr().add(DEFAULT_STACK_SIZE) as usize,
+                        16,
+                    );
+                    available_thread.ctx.rsp -= 16;
+                    (available_thread.ctx.rsp as *mut usize).write_volatile(f as usize);
+
+                    println!("spawned thread {}", available_thread.ctx.rsp);
+                }
+
+                available_thread.state = State::Ready;
+                println!("spawned thread {}", available_thread.id);
+            }
+        }
+    }
+}
+
+thread_local! {
+    static START: Once = Once::new();
+    pub static RUNTIME: usize = Box::into_raw(Box::new(Runtime::new())) as usize
+}
+fn retrive_thread_local_rt<'a>() -> &'a mut Runtime {
+    let mut addr = 0;
+    RUNTIME.with(|rt_addr| addr = *rt_addr);
+
+    unsafe { &mut *(addr as *mut Runtime) }
+}
 
 #[no_mangle]
-pub extern "C" fn add(a: i32, b: i32) -> i32 {
-    a + b
+pub extern "C" fn spawn(f: extern "C" fn()) {
+    retrive_thread_local_rt().spawn(f);
 }
 
-// // the -> ! means that this function won't return
-// #[panic_handler]
-// fn panic(info: &core::panic::PanicInfo) -> ! {
-//     if let Some(p) = info.location() {
-//     } else {
-//     }
-//     abort();
-// }
+#[no_mangle]
+pub extern "C" fn yield_now() {
+    retrive_thread_local_rt().yield_now();
+}
 
-// // https://internals.rust-lang.org/t/why-rust-has-name-mangling/12503
-// // turns off Rust's name mangling so the symbol is exactly eh_personality
-// #[no_mangle]
-// extern "C" fn abort() -> ! {
-//     loop {
-//         unsafe {
-//             riscv::asm::wfi();
-//         }
-//     }
-// }
+#[no_mangle]
+pub extern "C" fn t_return() {
+    retrive_thread_local_rt().t_return()
+}
+
+#[no_mangle]
+pub extern "C" fn schedule() {
+    START.with(|start| {
+        start.call_once(|| {
+            retrive_thread_local_rt().schedule();
+        })
+    })
+}
